@@ -10,9 +10,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 eframe = "0.21.0"
+egui = "0.21.0"
 egui_node_graph = { path = "../egui_node_graph" }
 anyhow = "1.0"
 serde = { version = "1.0", optional = true }
+polars = { version = "0.37.0", features = ["lazy", "temporal", "describe", "json", "parquet", "dtype-datetime"] }
+egui_extras = "0.21.0"
 
 [features]
 default = []

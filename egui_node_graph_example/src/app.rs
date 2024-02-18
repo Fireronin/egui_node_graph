@@ -1,8 +1,17 @@
 use std::{borrow::Cow, collections::HashMap};
 
 use eframe::egui::{self, DragValue, TextStyle};
+use egui::emath::Numeric;
+use egui::plot::{Legend, Line, Plot, PlotPoints};
+use egui_extras::{Column, TableBuilder};
 use egui_node_graph::*;
-
+use polars::prelude::*;
+//use polars_io::prelude::*;
+use polars::frame::DataFrame;
+use polars::series::Series;
+use std::fs::File;
+use std::sync::Arc;
+use polars::datatypes::DataType;
 // ========= First, define your user data types =============
 
 /// The NodeData holds a custom data struct inside each node. It's useful to
@@ -21,6 +30,9 @@ pub struct MyNodeData {
 pub enum MyDataType {
     Scalar,
     Vec2,
+    String,
+    Series,
+    DataFrame,
 }
 
 /// In the graph, input parameters can optionally have a constant value. This
@@ -30,11 +42,14 @@ pub enum MyDataType {
 /// this library makes no attempt to check this consistency. For instance, it is
 /// up to the user code in this example to make sure no parameter is created
 /// with a DataType of Scalar and a ValueType of Vec2.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 pub enum MyValueType {
     Vec2 { value: egui::Vec2 },
     Scalar { value: f32 },
+    String { value: String },
+    Series { value: Series },
+    DataFrame { value: DataFrame },
 }
 
 impl Default for MyValueType {
@@ -63,12 +78,35 @@ impl MyValueType {
             anyhow::bail!("Invalid cast from {:?} to scalar", self)
         }
     }
+
+    pub fn try_to_string(self) -> anyhow::Result<String> {
+        if let MyValueType::String { value } = self {
+            Ok(value)
+        } else {
+            anyhow::bail!("Invalid cast from {:?} to string", self)
+        }
+    }
+    pub fn try_to_series(self) -> anyhow::Result<Series> {
+        if let MyValueType::Series { value } = self {
+            Ok(value)
+        } else {
+            anyhow::bail!("Invalid cast from {:?} to series", self)
+        }
+    }
+
+    pub fn try_to_dataframe(self) -> anyhow::Result<DataFrame> {
+        if let MyValueType::DataFrame { value } = self {
+            Ok(value)
+        } else {
+            anyhow::bail!("Invalid cast from {:?} to dataframe", self)
+        }
+    }
 }
 
 /// NodeTemplate is a mechanism to define node templates. It's what the graph
 /// will display in the "new node" popup. The user code needs to tell the
 /// library how to convert a NodeTemplate into a Node.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 pub enum MyNodeTemplate {
     MakeScalar,
@@ -78,6 +116,10 @@ pub enum MyNodeTemplate {
     AddVector,
     SubtractVector,
     VectorTimesScalar,
+    LoadCSV,
+    CountRows,
+    SelectColumn,
+    SimpleFilter,
 }
 
 /// The response type is used to encode side-effects produced when drawing a
@@ -107,6 +149,9 @@ impl DataTypeTrait<MyGraphState> for MyDataType {
         match self {
             MyDataType::Scalar => egui::Color32::from_rgb(38, 109, 211),
             MyDataType::Vec2 => egui::Color32::from_rgb(238, 207, 109),
+            MyDataType::String => egui::Color32::from_rgb(134, 51, 109),
+            MyDataType::Series => egui::Color32::from_rgb(31, 207, 180),
+            MyDataType::DataFrame => egui::Color32::from_rgb(60, 100, 80),
         }
     }
 
@@ -114,6 +159,9 @@ impl DataTypeTrait<MyGraphState> for MyDataType {
         match self {
             MyDataType::Scalar => Cow::Borrowed("scalar"),
             MyDataType::Vec2 => Cow::Borrowed("2d vector"),
+            MyDataType::String => Cow::Borrowed("string"),
+            MyDataType::Series => Cow::Borrowed("series"),
+            MyDataType::DataFrame => Cow::Borrowed("dataframe"),
         }
     }
 }
@@ -136,6 +184,11 @@ impl NodeTemplateTrait for MyNodeTemplate {
             MyNodeTemplate::AddVector => "Vector add",
             MyNodeTemplate::SubtractVector => "Vector subtract",
             MyNodeTemplate::VectorTimesScalar => "Vector times scalar",
+
+            MyNodeTemplate::LoadCSV => "Load CSV",
+            MyNodeTemplate::CountRows => "Count rows",
+            MyNodeTemplate::SelectColumn => "Select column",
+            MyNodeTemplate::SimpleFilter => "Simple filter",
         })
     }
 
@@ -149,6 +202,10 @@ impl NodeTemplateTrait for MyNodeTemplate {
             | MyNodeTemplate::AddVector
             | MyNodeTemplate::SubtractVector => vec!["Vector"],
             MyNodeTemplate::VectorTimesScalar => vec!["Vector", "Scalar"],
+            MyNodeTemplate::LoadCSV => vec!["Table", "Scalar"],
+            MyNodeTemplate::CountRows => vec!["Table", "Scalar"],
+            MyNodeTemplate::SelectColumn => vec!["Table", "Scalar"],
+            MyNodeTemplate::SimpleFilter => vec!["Table", "Scalar"],
         }
     }
 
@@ -183,6 +240,20 @@ impl NodeTemplateTrait for MyNodeTemplate {
                 true,
             );
         };
+
+        let input_string = |graph: &mut MyGraph, name: &str| {
+            graph.add_input_param(
+                node_id,
+                name.to_string(),
+                MyDataType::String,
+                MyValueType::String {
+                    value: "".to_string(),
+                },
+                InputParamKind::ConnectionOrConstant,
+                true,
+            );
+        };
+
         let input_vector = |graph: &mut MyGraph, name: &str| {
             graph.add_input_param(
                 node_id,
@@ -196,11 +267,45 @@ impl NodeTemplateTrait for MyNodeTemplate {
             );
         };
 
+        let input_dataframe = |graph: &mut MyGraph, name: &str| {
+            graph.add_input_param(
+                node_id,
+                name.to_string(),
+                MyDataType::DataFrame,
+                MyValueType::DataFrame {
+                    value: DataFrame::empty(),
+                },
+                InputParamKind::ConnectionOrConstant,
+                true,
+            );
+        };
+
+        let input_series = |graph: &mut MyGraph, name: &str| {
+            graph.add_input_param(
+                node_id,
+                name.to_string(),
+                MyDataType::Series,
+                MyValueType::Series {
+                    value: Series::new("empty", &[] as &[i32]),
+                },
+                InputParamKind::ConnectionOrConstant,
+                true,
+            );
+        };
+
         let output_scalar = |graph: &mut MyGraph, name: &str| {
             graph.add_output_param(node_id, name.to_string(), MyDataType::Scalar);
         };
         let output_vector = |graph: &mut MyGraph, name: &str| {
             graph.add_output_param(node_id, name.to_string(), MyDataType::Vec2);
+        };
+
+        let output_dataframe = |graph: &mut MyGraph, name: &str| {
+            graph.add_output_param(node_id, name.to_string(), MyDataType::DataFrame);
+        };
+
+        let output_series = |graph: &mut MyGraph, name: &str| {
+            graph.add_output_param(node_id, name.to_string(), MyDataType::Series);
         };
 
         match self {
@@ -254,6 +359,30 @@ impl NodeTemplateTrait for MyNodeTemplate {
                 input_scalar(graph, "value");
                 output_scalar(graph, "out");
             }
+
+            MyNodeTemplate::LoadCSV => {
+                input_string(graph, "path");
+                output_dataframe(graph, "out");
+            }
+
+            MyNodeTemplate::CountRows => {
+                input_dataframe(graph, "df");
+                output_scalar(graph, "out");
+            }
+
+            MyNodeTemplate::SelectColumn => {
+                input_dataframe(graph, "df");
+                input_string(graph, "column");
+                output_series(graph, "out");
+            }
+
+            MyNodeTemplate::SimpleFilter => {
+                input_series(graph, "df");
+                // min and max values for the filter
+                input_scalar(graph, "min");
+                input_scalar(graph, "max");
+                output_series(graph, "out");
+            }
         }
     }
 }
@@ -274,6 +403,10 @@ impl NodeTemplateIter for AllMyNodeTemplates {
             MyNodeTemplate::AddVector,
             MyNodeTemplate::SubtractVector,
             MyNodeTemplate::VectorTimesScalar,
+            MyNodeTemplate::LoadCSV,
+            MyNodeTemplate::CountRows,
+            MyNodeTemplate::SelectColumn,
+            MyNodeTemplate::SimpleFilter,
         ]
     }
 }
@@ -306,6 +439,24 @@ impl WidgetValueTrait for MyValueType {
                 ui.horizontal(|ui| {
                     ui.label(param_name);
                     ui.add(DragValue::new(value));
+                });
+            }
+            MyValueType::String { value } => {
+                ui.horizontal(|ui| {
+                    ui.label(param_name);
+                    ui.add(egui::TextEdit::singleline(value));
+                });
+            }
+            MyValueType::Series { value } => {
+                ui.horizontal(|ui| {
+                    ui.label(param_name);
+                    ui.label("Series");
+                });
+            }
+            MyValueType::DataFrame { value } => {
+                ui.horizontal(|ui| {
+                    ui.label(param_name);
+                    ui.label("DataFrame");
                 });
             }
         }
@@ -413,8 +564,93 @@ impl eframe::App for NodeGraphExample {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 egui::widgets::global_dark_light_mode_switch(ui);
+                ui.menu_button("File", |ui| {
+                    if ui.button("Save").clicked() {
+                        //functionality
+                    }
+                    if ui.button("Quit").clicked() {
+                        std::process::exit(0);
+                    }
+                });
             });
         });
+
+        egui::SidePanel::right("side_panel").show(ctx, |ui| {
+            let node_id = self.user_state.active_node;
+            if let Some(node_id) = node_id {
+                let node_data = &self.state.graph[node_id].user_data;
+                ui.label(format!("Active node: {:?}", node_id));
+                if node_data.template == MyNodeTemplate::LoadCSV {
+                    let output_id = self.state.graph.nodes[node_id].get_output("out").unwrap();
+                    let data = evaluate_node(&self.state.graph, node_id, &mut HashMap::new());
+
+                    if let Ok(MyValueType::DataFrame { value }) = data {
+                        let table_shape = value.shape();
+                        ui.label(format!("Table shape: {:?}", table_shape));
+                        // visualize the table (value ) as egui Grid
+                        let table = TableBuilder::new(ui)
+                        .striped(true)
+                        .resizable(true)
+                        .columns(Column::auto(), table_shape.1 as usize)
+                        .header(20.0, |mut header| {
+                            for col in 0..table_shape.1 {
+                                header.col(|ui| {
+                                    ui.label(format!("{}", value.get_columns()[col].name()));
+                                });
+                            }
+                        })
+                        .body(|mut body| {
+                            for row_idx in 0..table_shape.0 {
+                                body.row(30.0, |mut row| {
+                                    for col in value.get_columns() {
+                                        row.col(|ui| {
+                                            ui.label(col.get(row_idx).unwrap().to_string());
+                                        });
+                                    }
+                                });
+                            }
+                        });
+                    } else {
+                        ui.label("No table");
+                    }
+                }
+
+                if node_data.template == MyNodeTemplate::SelectColumn {
+                    let column_plot = Plot::new("Column plot").legend(Legend::default());
+                    // get output series
+                    let output_id = self.state.graph.nodes[node_id].get_output("out").unwrap();
+                    let data = evaluate_node(&self.state.graph, node_id, &mut HashMap::new());
+                    let series = match data {
+                        Ok(MyValueType::Series { value }) => value,
+                        _ => Series::new("empty", &[] as &[i32]),
+                    };
+                    let series = series.cast(&DataType::Float32).unwrap();
+
+                    // vec<[f32;2] of x and y values
+                    let y_vec_option : Vec<Option<f32>> = series.f32().unwrap().into_iter().collect();
+                    let y_vec =  y_vec_option.into_iter().map(|x| x.unwrap_or_default()).collect::<Vec<f32>>();
+
+                    let y_arr = y_vec.as_slice();
+                    
+                    let inner = column_plot.show(ui,|plot_ui| {
+                        plot_ui.line(Line::new(PlotPoints::from_ys_f32(y_arr)).color(egui::Color32::RED));
+                        });
+                    
+                            
+                    
+
+
+                }
+
+                // egui::Grid::new("node_data").show(ui, |ui| {
+                //     ui.label("Template:");
+                //     ui.label(format!("{:?}", node_data.template));
+                // });
+            } else {
+                ui.label("No active node");
+            }
+        });
+
         let graph_response = egui::CentralPanel::default()
             .show(ctx, |ui| {
                 self.state.draw_graph_editor(
@@ -514,12 +750,29 @@ pub fn evaluate_node(
         fn input_scalar(&mut self, name: &str) -> anyhow::Result<f32> {
             self.evaluate_input(name)?.try_to_scalar()
         }
+
+        fn input_series(&mut self, name: &str) -> anyhow::Result<Series> {
+            self.evaluate_input(name)?.try_to_series()
+        }
+
         fn output_vector(&mut self, name: &str, value: egui::Vec2) -> anyhow::Result<MyValueType> {
             self.populate_output(name, MyValueType::Vec2 { value })
         }
         fn output_scalar(&mut self, name: &str, value: f32) -> anyhow::Result<MyValueType> {
             self.populate_output(name, MyValueType::Scalar { value })
         }
+        fn output_dataframe(
+            &mut self,
+            name: &str,
+            value: DataFrame,
+        ) -> anyhow::Result<MyValueType> {
+            self.populate_output(name, MyValueType::DataFrame { value })
+        }
+
+        fn output_series(&mut self, name: &str, value: Series) -> anyhow::Result<MyValueType> {
+            self.populate_output(name, MyValueType::Series { value })
+        }
+
     }
 
     let node = &graph[node_id];
@@ -559,6 +812,46 @@ pub fn evaluate_node(
             let value = evaluator.input_scalar("value")?;
             evaluator.output_scalar("out", value)
         }
+        MyNodeTemplate::LoadCSV => {
+            let path = evaluator.evaluate_input("path")?.try_to_string()?;
+            let df_csv = CsvReader::from_path(path)?
+                .infer_schema(None)
+                .has_header(true)
+                .finish()?;
+            evaluator.output_dataframe("out", df_csv)
+        }
+        MyNodeTemplate::CountRows => {
+            let df = evaluator.evaluate_input("df")?.try_to_dataframe()?;
+            let rows = df.height();
+            evaluator.output_scalar("out", rows as f32)
+        }
+
+        MyNodeTemplate::SelectColumn => {
+            let df = evaluator.evaluate_input("df")?.try_to_dataframe()?;
+            let column_name = evaluator.evaluate_input("column")?.try_to_string()?;
+            // check if the column exists
+            if df.get_column_index(column_name.as_str()).is_some() {
+                let series = df.column(column_name.as_str()).unwrap();
+                evaluator.output_series("out", series.clone())
+            } else {
+                evaluator.output_series("out", Series::new("empty", &[] as &[i32]))
+            }
+            
+        }
+
+        MyNodeTemplate::SimpleFilter => {
+            let series = evaluator.evaluate_input("df")?.try_to_series()?;
+            let min = evaluator.input_scalar("min")?;
+            let max = evaluator.input_scalar("max")?;
+            
+            let gt_filter: ChunkedArray<BooleanType> = series.gt_eq(min).unwrap();
+            let filtered_by_gt = series.filter(&gt_filter).unwrap();
+            let lt_filter: ChunkedArray<BooleanType> = filtered_by_gt.lt_eq(max).unwrap();
+            let filtered_series = filtered_by_gt.filter(&lt_filter).unwrap();
+            evaluator.output_series("out", filtered_series)
+            
+        }
+
     }
 }
 
@@ -570,7 +863,7 @@ fn populate_output(
     value: MyValueType,
 ) -> anyhow::Result<MyValueType> {
     let output_id = graph[node_id].get_output(param_name)?;
-    outputs_cache.insert(output_id, value);
+    outputs_cache.insert(output_id, value.clone());
     Ok(value)
 }
 
@@ -588,7 +881,7 @@ fn evaluate_input(
         // The value was already computed due to the evaluation of some other
         // node. We simply return value from the cache.
         if let Some(other_value) = outputs_cache.get(&other_output_id) {
-            Ok(*other_value)
+            Ok(other_value.clone())
         }
         // This is the first time encountering this node, so we need to
         // recursively evaluate it.
@@ -597,13 +890,14 @@ fn evaluate_input(
             evaluate_node(graph, graph[other_output_id].node, outputs_cache)?;
 
             // Now that we know the value is cached, return it
-            Ok(*outputs_cache
+            Ok(outputs_cache
                 .get(&other_output_id)
-                .expect("Cache should be populated"))
+                .expect("Cache should be populated")
+                .clone())
         }
     }
     // No existing connection, take the inline value instead.
     else {
-        Ok(graph[input_id].value)
+        Ok(graph[input_id].value.clone())
     }
 }
